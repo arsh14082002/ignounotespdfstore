@@ -6,33 +6,26 @@ import {
   getNotesBySemester,
   getSingleNote,
   updateNote,
-  incrementDownloadsCount,
   uploadNote,
-  totalCount,
+  getTotalDownloadCount,
+  incrementDownloadCount,
+  getDownloadCountById,
+  getDeviceCounts,
 } from '../controllers/noteController.js';
 import auth from '../middleware/auth.js';
+import { uploadMiddleware } from '../middleware/multer.js';
 
 const noteRouter = Router();
 
-const storage = multer.memoryStorage(); // Use memory storage
-const upload = multer({
-  storage: storage,
-  limits: { fileSize: 3e7 }, // 30 MB
-});
-
-// Handle multiple file uploads
-const uploadMiddleware = upload.fields([
-  { name: 'pdfnote', maxCount: 1 },
-  // { name: 'bannerImage', maxCount: 1 },
-]);
-
 noteRouter.post('/uploads', auth, uploadMiddleware, uploadNote);
 noteRouter.get('/notes', getAllNotes);
-noteRouter.get('/notes/:id', auth, getSingleNote); // New route for fetching a single note
+noteRouter.get('/notes/:id', auth, getSingleNote);
 noteRouter.delete('/notes/:id', auth, deleteNote);
 noteRouter.put('/notes/:id', auth, uploadMiddleware, updateNote);
 noteRouter.get('/notes/semester/:semester', getNotesBySemester);
-noteRouter.post('/increment-download/:id', auth, incrementDownloadsCount);
-noteRouter.get('/total-downloads', auth, totalCount);
+noteRouter.get('/total-downloads', getTotalDownloadCount);
+noteRouter.get('/download-count/:id', getDownloadCountById);
+noteRouter.post('/increment-download/:id', incrementDownloadCount);
+noteRouter.get('/device-counts', getDeviceCounts);
 
 export default noteRouter;

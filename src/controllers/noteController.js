@@ -1,11 +1,18 @@
-import noteModel from '../models/noteModels.js';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+import fs from 'fs-extra';
 import path from 'path';
-import fs from 'fs';
 import { v2 as cloudinary } from 'cloudinary';
 import { config } from 'dotenv';
-import streamifier from 'streamifier';
+import noteModel from '../models/noteModels.js';
+import Visit from '../models/visitModel.js'; // Adjust the path if necessary
 
 config();
+
+// Get the directory name of the current module file
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const uploadsDir = path.join(__dirname, '../../public/uploads');
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -13,16 +20,16 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_SECRET_KEY,
 });
 
-const uploadToCloudinary = (file, folder, resourceType) => {
+const uploadToCloudinary = (filePath, folder, resourceType) => {
   return new Promise((resolve, reject) => {
-    const stream = cloudinary.uploader.upload_stream(
-      { folder, resource_type: resourceType, allowedFormats: 'pdf' },
+    cloudinary.uploader.upload(
+      filePath,
+      { folder, resource_type: resourceType, allowed_formats: 'pdf' },
       (error, result) => {
         if (error) reject(error);
         else resolve(result);
       },
     );
-    streamifier.createReadStream(file.buffer).pipe(stream);
   });
 };
 
@@ -33,10 +40,23 @@ export const uploadNote = async (req, res) => {
     return res.status(400).json({ message: 'PDF Note is required' });
   }
 
+  // Define file path
+  const pdfFile = req.files.pdfnote[0];
+  const localFilePath = path.join(uploadsDir, pdfFile.originalname);
+
   try {
-    // Upload PDF file
-    const pdfResult = await uploadToCloudinary(req.files.pdfnote[0], 'pdf-notes/notes', 'raw');
+    // Ensure the directory exists
+    await fs.ensureDir(uploadsDir);
+
+    // Save the file locally
+    await fs.outputFile(localFilePath, pdfFile.buffer);
+
+    // Upload PDF file to Cloudinary
+    const pdfResult = await uploadToCloudinary(localFilePath, 'pdf-notes/notes', 'raw');
     const pdfUrl = pdfResult.secure_url;
+
+    // Remove the local file
+    await fs.remove(localFilePath);
 
     // Create a new note
     const newNote = new noteModel({
@@ -58,8 +78,65 @@ export const uploadNote = async (req, res) => {
   }
 };
 
+export const updateNote = async (req, res) => {
+  const { id } = req.params;
+  const { title, description, subject, semester, handWritten } = req.body;
+
+  try {
+    const note = await noteModel.findById(id);
+
+    if (!note) {
+      return res.status(404).json({ message: 'Note not found' });
+    }
+
+    if (req.files && req.files.pdfnote && req.files.pdfnote.length > 0) {
+      // Define file paths
+      const pdfFile = req.files.pdfnote[0];
+      const localFilePath = path.join(uploadsDir, pdfFile.originalname);
+
+      // Ensure the directory exists
+      await fs.ensureDir(uploadsDir);
+
+      // Save the PDF file locally
+      await fs.outputFile(localFilePath, pdfFile.buffer);
+
+      // Upload the new PDF to Cloudinary
+      const newPdfResult = await uploadToCloudinary(localFilePath, 'pdf-notes/notes', 'raw');
+      const newPdfUrl = newPdfResult.secure_url;
+
+      // Remove the old PDF from Cloudinary if it exists
+      const oldPdfPublicId = path.basename(note.pdfUrl, path.extname(note.pdfUrl));
+      if (oldPdfPublicId) {
+        await cloudinary.uploader.destroy(`pdf-notes/notes/${oldPdfPublicId}`, {
+          resource_type: 'raw',
+        });
+      }
+
+      // Remove the local file after uploading to Cloudinary
+      await fs.remove(localFilePath);
+
+      // Update the note with the new PDF URL
+      note.pdfUrl = newPdfUrl;
+    }
+
+    // Update other note fields
+    note.title = title;
+    note.description = description;
+    note.subject = subject;
+    note.semester = semester;
+    note.handWritten = handWritten;
+
+    await note.save();
+
+    res.status(200).json(note);
+  } catch (error) {
+    console.error('Error updating note:', error);
+    res.status(500).json({ message: 'Internal Server Error' });
+  }
+};
+
 export const getAllNotes = async (req, res) => {
-  const { semester } = req.query;
+  const { semester, page = 1, limit = 20 } = req.query;
 
   try {
     let filter = {};
@@ -69,13 +146,33 @@ export const getAllNotes = async (req, res) => {
       filter.semester = normalizedSemester;
     }
 
-    const notes = await noteModel.find(filter);
+    // Convert `page` and `limit` to numbers
+    const pageNumber = parseInt(page, 10);
+    const pageSize = parseInt(limit, 10);
 
-    if (notes.length === 0) {
-      console.log('No notes found for this semester.');
+    // Validate `page` and `limit`
+    if (isNaN(pageNumber) || pageNumber < 1) {
+      return res.status(400).json({ message: 'Invalid page number' });
+    }
+    if (isNaN(pageSize) || pageSize < 1) {
+      return res.status(400).json({ message: 'Invalid limit' });
     }
 
-    res.status(200).json(notes);
+    // Calculate the number of documents to skip
+    const skip = (pageNumber - 1) * pageSize;
+
+    // Fetch the notes with pagination
+    const notes = await noteModel.find(filter).skip(skip).limit(pageSize).sort({ createdAt: -1 });
+
+    // Count total number of notes for pagination info
+    const totalNotes = await noteModel.countDocuments(filter);
+
+    res.status(200).json({
+      notes,
+      totalPages: Math.ceil(totalNotes / pageSize),
+      currentPage: pageNumber,
+      totalNotes,
+    });
   } catch (error) {
     console.error('Error fetching notes:', error);
     res.status(500).json({ message: 'Internal Server Error' });
@@ -122,43 +219,6 @@ export const deleteNote = async (req, res) => {
   }
 };
 
-export const updateNote = async (req, res) => {
-  const { id } = req.params;
-  const { title, description, subject, semester, handWritten } = req.body;
-
-  try {
-    const note = await noteModel.findById(id);
-
-    if (!note) {
-      return res.status(404).json({ message: 'Note not found' });
-    }
-
-    if (req.files && req.files.pdfnote && req.files.pdfnote.length > 0) {
-      const newPdfResult = await uploadToCloudinary(req.files.pdfnote[0], 'pdf-notes/notes', 'raw');
-      const oldPdfPublicId = path.basename(note.pdfUrl, path.extname(note.pdfUrl));
-      if (oldPdfPublicId) {
-        await cloudinary.uploader.destroy(`pdf-notes/notes/${oldPdfPublicId}`, {
-          resource_type: 'raw',
-        });
-      }
-      note.pdfUrl = newPdfResult.secure_url;
-    }
-
-    note.title = title;
-    note.description = description;
-    note.subject = subject;
-    note.semester = semester;
-    note.handWritten = handWritten;
-
-    await note.save();
-
-    res.status(200).json(note);
-  } catch (error) {
-    console.error('Error updating note:', error);
-    res.status(500).json({ message: 'Internal Server Error' });
-  }
-};
-
 export const getNotesBySemester = async (req, res) => {
   const { semester } = req.params; // Get semester from route params
   const { handWritten, subjectCode } = req.query; // Get filters from query parameters
@@ -191,7 +251,30 @@ export const getNotesBySemester = async (req, res) => {
   }
 };
 
-export const incrementDownloadsCount = async (req, res) => {
+export const getTotalDownloadCount = async (req, res) => {
+  try {
+    // Aggregate total download count from all notes
+    const result = await noteModel.aggregate([
+      {
+        $group: {
+          _id: null,
+          totalDownloads: { $sum: '$downloadCount' },
+        },
+      },
+    ]);
+
+    const totalDownloads = result.length > 0 ? result[0].totalDownloads : 0;
+
+    res.status(200).json({ totalDownloads });
+  } catch (error) {
+    console.log('Error fetching total download count:', error);
+
+    res.status(500).json({ message: 'Internal Server Error' });
+  }
+};
+
+// In your noteController.js or equivalent
+export const getDownloadCountById = async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -201,24 +284,55 @@ export const incrementDownloadsCount = async (req, res) => {
       return res.status(404).json({ message: 'Note not found' });
     }
 
+    res.status(200).json({ downloadCount: note.downloadCount });
+  } catch (error) {
+    console.error('Error fetching download count by ID:', error);
+    res.status(500).json({ message: 'Internal Server Error' });
+  }
+};
+
+// In your noteController.js or equivalent
+export const incrementDownloadCount = async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const note = await noteModel.findById(id);
+
+    if (!note) {
+      return res.status(404).json({ message: 'Note not found' });
+    }
+
+    // Increment the download count
     note.downloadCount += 1;
     await note.save();
 
-    res.status(200).json(note);
+    res.status(200).json({
+      message: 'Download count incremented successfully',
+      downloadCount: note.downloadCount,
+    });
   } catch (error) {
     console.error('Error incrementing download count:', error);
     res.status(500).json({ message: 'Internal Server Error' });
   }
 };
 
-export const totalCount = async (req, res) => {
+export const getDeviceCounts = async (req, res) => {
   try {
-    const notes = await noteModel.find();
-    const totalDownloads = notes.reduce((sum, note) => sum + note.downloadsCount, 0);
+    const deviceCounts = await Visit.aggregate([
+      {
+        $group: {
+          _id: '$userAgent',
+          count: { $sum: 1 },
+        },
+      },
+      {
+        $sort: { count: -1 }, // Sort by count
+      },
+    ]);
 
-    res.status(200).json({ totalDownloads });
+    res.status(200).json(deviceCounts);
   } catch (error) {
-    console.error('Error calculating total downloads:', error);
+    console.error('Error fetching device counts:', error);
     res.status(500).json({ message: 'Internal Server Error' });
   }
 };
